@@ -6,29 +6,24 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 include(FetchContent)
 FetchContent_Declare(
-  shadowhook
-  GIT_REPOSITORY https://github.com/bytedance/android-inline-hook.git
-  GIT_TAG        v2.0.1
+  and64inlinehook
+  GIT_REPOSITORY https://github.com/Rprop/And64InlineHook.git
+  GIT_TAG        master
   GIT_SHALLOW    TRUE
-  SOURCE_SUBDIR  shadowhook/src/main/cpp
-  PATCH_COMMAND  sed -i "s/cmake_minimum_required(VERSION 4.0.2)/cmake_minimum_required(VERSION 3.20)/" shadowhook/src/main/cpp/CMakeLists.txt
 )
-FetchContent_MakeAvailable(shadowhook)
-
-target_compile_options(shadowhook PRIVATE -Wno-error)
-target_compile_options(shadowhook PRIVATE -Wno-declaration-after-statement)
-target_compile_options(shadowhook PRIVATE -Wno-unsafe-buffer-usage)
-
-target_link_options(shadowhook PRIVATE -Wl,--undefined-version)
+FetchContent_MakeAvailable(and64inlinehook)
 
 add_library(fbrian SHARED main.cpp)
 
 target_include_directories(fbrian PRIVATE
-  ${shadowhook_SOURCE_DIR}/shadowhook/src/main/cpp/include
+  ${and64inlinehook_SOURCE_DIR}
+)
+
+target_sources(fbrian PRIVATE
+  ${and64inlinehook_SOURCE_DIR}/And64InlineHook.cpp
 )
 
 target_link_libraries(fbrian PRIVATE
-  shadowhook
   log
   android
   dl
