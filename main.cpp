@@ -3,10 +3,9 @@
 #include <dlfcn.h>
 #include <pthread.h>
 #include <unistd.h>
+#include <sys/mman.h>
 #include <cstring>
 #include <cstdint>
-
-#include "dobby.h"
 
 #define TAG "SWLMods"
 #define logI(...) __android_log_print(ANDROID_LOG_INFO,  TAG, __VA_ARGS__)
@@ -26,15 +25,15 @@ struct Il2cpp {
 };
 
 struct Targets {
-  void* initiatePurchase;
-  void* debugPurchase;
-  void* hasInfinity;
-  void* actualHasInfinity;
-  void* hasDisabledAds;
-  void* actualHasDisabledAds;
-  void* mayShowAd;
-  void* revokeWithBool;
-  void* revoke;
+  void** slotInitiate;
+  void*  fnDebug;
+  void** slotHasInfinity;
+  void** slotActualHasInfinity;
+  void** slotHasDisabledAds;
+  void** slotActualHasDisabledAds;
+  void** slotMayShowAd;
+  void** slotRevokeWithBool;
+  void** slotRevoke;
 };
 
 static Il2cpp  il       = {};
@@ -100,10 +99,28 @@ static bool resolveIl2cpp() {
   return true;
 }
 
-static void* methodPtr(void* method) {
-  void* p = *reinterpret_cast<void**>(method);
-  if (p) return p;
-  return *reinterpret_cast<void**>(reinterpret_cast<char*>(method) + 8);
+static bool isExecPtr(void* p) {
+  if (!p) return false;
+  Dl_info info;
+  return dladdr(p, &info) != 0;
+}
+
+static void** methodSlot(void* m) {
+  void** s0 = reinterpret_cast<void**>(m);
+  if (isExecPtr(*s0)) return s0;
+  void** s8 = reinterpret_cast<void**>(reinterpret_cast<char*>(m) + 8);
+  if (isExecPtr(*s8)) return s8;
+  return nullptr;
+}
+
+static bool patchSlot(void** slot, void* fn) {
+  uintptr_t page = reinterpret_cast<uintptr_t>(slot) & ~0xFFFULL;
+  mprotect(reinterpret_cast<void*>(page), 0x2000,
+           PROT_READ | PROT_WRITE | PROT_EXEC);
+  *slot = fn;
+  __builtin___clear_cache(reinterpret_cast<char*>(slot),
+                          reinterpret_cast<char*>(slot) + sizeof(void*));
+  return true;
 }
 
 static void scanTargets(void* klass) {
@@ -113,22 +130,22 @@ static void scanTargets(void* klass) {
     const char* name = il.methodName(m);
     if (!name) continue;
     int argc = il.paramCount(m);
-    void* ptr = methodPtr(m);
-    if (!ptr) continue;
+    void** slot = methodSlot(m);
+    if (!slot) continue;
 
 #define match(mname, args, field) \
     if (!tgt.field && strcmp(name, mname) == 0 && argc == (args)) { \
-      tgt.field = ptr; logI("[+] %s(%d) @ %p", mname, args, ptr); continue; }
+      tgt.field = slot; logI("[+] %s(%d) @ %p", mname, args, *slot); continue; }
 
-    match("InitiatePurchase",          1, initiatePurchase)
-    match("DebugEditorPurchase",       1, debugPurchase)
-    match("get_HasInfinityPack",       0, hasInfinity)
-    match("get_ActualHasInfinityPack", 0, actualHasInfinity)
-    match("get_HasDisabledAds",        0, hasDisabledAds)
-    match("get_ActualHasDisabledAds",  0, actualHasDisabledAds)
-    match("MayShowAnAd",               0, mayShowAd)
-    match("Revoke",                    1, revokeWithBool)
-    match("Revoke",                    0, revoke)
+    match("InitiatePurchase",          1, slotInitiate)
+    match("DebugEditorPurchase",       1, fnDebug)
+    match("get_HasInfinityPack",       0, slotHasInfinity)
+    match("get_ActualHasInfinityPack", 0, slotActualHasInfinity)
+    match("get_HasDisabledAds",        0, slotHasDisabledAds)
+    match("get_ActualHasDisabledAds",  0, slotActualHasDisabledAds)
+    match("MayShowAnAd",               0, slotMayShowAd)
+    match("Revoke",                    1, slotRevokeWithBool)
+    match("Revoke",                    0, slotRevoke)
 #undef match
   }
 }
@@ -165,38 +182,31 @@ static void findIapClass() {
 
 typedef void (*VoidPtrFn)(void*);
 
-static void* origInitiate = nullptr;
-
 static void hookInitiate(void* productId) {
-  if (tgt.debugPurchase)
-    reinterpret_cast<VoidPtrFn>(tgt.debugPurchase)(productId);
+  if (tgt.fnDebug)
+    reinterpret_cast<VoidPtrFn>(tgt.fnDebug)(productId);
   showToast("MODS: Pembelian berhasil disimulasikan.");
 }
 
-static bool retTrue()  { return true;  }
-static bool retFalse() { return false; }
-static void noop()     {}
+static bool retTrue()      { return true;  }
+static bool retFalse()     { return false; }
+static void noop()         {}
 static void noopBool(bool) {}
 
 static void installHooks() {
-  if (tgt.initiatePurchase) {
-    DobbyHook(tgt.initiatePurchase,
-              reinterpret_cast<void*>(hookInitiate),
-              &origInitiate);
-    logI("[Hook] InitiatePurchase OK");
-  }
-#define hook(field, fn) do { if (tgt.field) { \
-    DobbyHook(tgt.field, reinterpret_cast<void*>(fn), nullptr); \
-    logI("[Hook] " #field " OK"); } } while (0)
+#define swap(field, fn) do { if (tgt.field) { \
+    patchSlot(tgt.field, reinterpret_cast<void*>(fn)); \
+    logI("[Swap] " #field " OK"); } } while (0)
 
-  hook(hasInfinity,          retTrue);
-  hook(actualHasInfinity,    retTrue);
-  hook(hasDisabledAds,       retTrue);
-  hook(actualHasDisabledAds, retTrue);
-  hook(mayShowAd,            retFalse);
-  hook(revokeWithBool,       noopBool);
-  hook(revoke,               noop);
-#undef hook
+  swap(slotInitiate,          hookInitiate);
+  swap(slotHasInfinity,       retTrue);
+  swap(slotActualHasInfinity, retTrue);
+  swap(slotHasDisabledAds,    retTrue);
+  swap(slotActualHasDisabledAds, retTrue);
+  swap(slotMayShowAd,         retFalse);
+  swap(slotRevokeWithBool,    noopBool);
+  swap(slotRevoke,            noop);
+#undef swap
 }
 
 static void* worker(void*) {
