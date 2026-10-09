@@ -43,6 +43,7 @@ static std::atomic<JavaVM*> jvm{nullptr};
 static constexpr bool verbose = true;
 static void lg(const char* fmt, ...) __attribute__((format(printf, 1, 2)));
 static void lgEx(JNIEnv* env);
+static void lgBind();
 #define dbg(msg) toast("debug: " msg)
 #else
 static constexpr bool verbose = false;

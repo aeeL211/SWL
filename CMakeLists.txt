@@ -31,6 +31,12 @@ add_library(fbrian SHARED
   main.cpp
 )
 
+# build debug: toast per tahap + log internal shadowhook (-DMODS_DEBUG=ON)
+option(MODS_DEBUG "Debug build" OFF)
+if(MODS_DEBUG)
+  target_compile_definitions(fbrian PRIVATE MODS_DEBUG)
+endif()
+
 target_include_directories(fbrian PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}
   ${SHADOWHOOK_INCLUDE_DIR}
