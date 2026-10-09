@@ -2,168 +2,222 @@
 #include <dlfcn.h>
 #include <pthread.h>
 #include <unistd.h>
-#include <cstring>
-#include <cstdint>
 #include <atomic>
+#include <cstdint>
+#include <cstdio>
+#include <cstring>
+#include <shadowhook.h>
 
-#include "And64InlineHook.hpp"
-
-// struktur api il2cpp
-struct Il2cppApi {
-  void* handle;
-  void* (*domainGet)();
-  void** (*getAssemblies)(void* domain, size_t* count);
-  void* (*imageOf)(void* assembly);
-  size_t (*classCount)(void* image);
-  void* (*classAt)(void* image, size_t idx);
-  void* (*methodsOf)(void* klass, void** iter);
-  const char* (*methodName)(void* method);
-  int (*paramCount)(void* method);
-  void* (*threadAttach)(void* domain);
-  void* (*methodGetPointer)(void* method);
+// api il2cpp
+struct Api {
+  void* h;
+  void* (*domain)();
+  void** (*assemblies)(void*, size_t*);
+  void* (*image)(void*);
+  size_t (*classCount)(void*);
+  void* (*classAt)(void*, size_t);
+  void* (*methods)(void*, void**);
+  const char* (*name)(void*);
+  int (*argc)(void*);
+  void* (*attach)(void*);
+  void* (*ptr)(void*);  // opsional
 };
 
-// struktur target fungsi untuk di-hook
-struct Targets {
-  void* initiate;
-  void* debug;
-  void* hasInfinity;
-  void* actualHasInfinity;
-  void* hasDisabledAds;
-  void* actualHasDisabledAds;
-  void* mayShowAd;
-  void* revokeWithBool;
-  void* revoke;
-};
+static Api il = {};
+static std::atomic<bool> started{false};
+static std::atomic<JavaVM*> jvm{nullptr};
 
-static Il2cppApi il2cpp = {};
-static Targets targets = {};
-static std::atomic<bool> isStarted{false};
-
-// resolve fungsi dari libil2cpp.so
-static bool resolveApi() {
-  il2cpp.handle = dlopen("libil2cpp.so", RTLD_LAZY | RTLD_NOLOAD);
-  if (!il2cpp.handle) il2cpp.handle = dlopen("libil2cpp.so", RTLD_LAZY);
-  if (!il2cpp.handle) return false;
-
-  #define BIND_API(field, name) \
-    il2cpp.field = reinterpret_cast<decltype(il2cpp.field)>(dlsym(il2cpp.handle, name)); \
-    if (!il2cpp.field) return false;
-
-  BIND_API(domainGet, "il2cpp_domain_get");
-  BIND_API(getAssemblies, "il2cpp_domain_get_assemblies");
-  BIND_API(imageOf, "il2cpp_assembly_get_image");
-  BIND_API(classCount, "il2cpp_image_get_class_count");
-  BIND_API(classAt, "il2cpp_image_get_class");
-  BIND_API(methodsOf, "il2cpp_class_get_methods");
-  BIND_API(methodName, "il2cpp_method_get_name");
-  BIND_API(paramCount, "il2cpp_method_get_param_count");
-  BIND_API(threadAttach, "il2cpp_thread_attach");
-  #undef BIND_API
-
-  // opsional, tidak semua versi il2cpp memiliki ini
-  il2cpp.methodGetPointer = reinterpret_cast<decltype(il2cpp.methodGetPointer)>(
-    dlsym(il2cpp.handle, "il2cpp_method_get_pointer"));
-
+// jalankan fungsi di thread detached
+static bool spawn(void* (*fn)(void*), void* arg) {
+  pthread_t t;
+  if (pthread_create(&t, nullptr, fn, arg) != 0) return false;
+  pthread_detach(t);
   return true;
 }
 
-// dapatkan alamat pointer dari method il2cpp
-static void* getMethodAddr(void* method) {
-  if (il2cpp.methodGetPointer) {
-    void* ptr = il2cpp.methodGetPointer(method);
-    if (ptr) return ptr;
+// tunggu kondisi sampai batas detik
+template <class F>
+static bool waitFor(int secs, F ok) {
+  for (int i = 0; i < secs; ++i) {
+    if (ok()) return true;
+    sleep(1);
   }
-  void* fallback = *reinterpret_cast<void**>(method);
-  if (fallback) return fallback;
-  return *reinterpret_cast<void**>(reinterpret_cast<char*>(method) + 8);
+  return false;
 }
 
-// validasi alamat memori
-static bool isValidAddr(void* addr) {
-  if (!addr) return false;
+// ---- toast ----
+// tiap toast jalan di thread native dengan looper sendiri
+
+static JavaVM* getVm() {
+  if (JavaVM* v = jvm.load()) return v;
+
+  // lib dimuat tanpa JNI_OnLoad, cari sendiri
+  void* sym = dlsym(RTLD_DEFAULT, "JNI_GetCreatedJavaVMs");
+  if (!sym) {
+    void* art = shadowhook_dlopen("libart.so");
+    if (art) sym = shadowhook_dlsym(art, "JNI_GetCreatedJavaVMs");
+    if (art) shadowhook_dlclose(art);
+  }
+  if (!sym) return nullptr;
+
+  JavaVM* v = nullptr;
+  jsize n = 0;
+  using Fn = jint (*)(JavaVM**, jsize, jsize*);
+  if (reinterpret_cast<Fn>(sym)(&v, 1, &n) != JNI_OK || n < 1) return nullptr;
+  jvm.store(v);
+  return v;
+}
+
+// true jika ada exception jni (dibersihkan)
+static bool bad(JNIEnv* env) {
+  if (!env->ExceptionCheck()) return false;
+  env->ExceptionClear();
+  return true;
+}
+
+// kembalikan v, atau nullptr jika jni melempar exception
+template <class T>
+static T chk(JNIEnv* env, T v) {
+  return bad(env) ? nullptr : v;
+}
+
+// context aplikasi tanpa kelas aplikasi
+static jobject appCtx(JNIEnv* env) {
+  static const char* const src[2][2] = {
+    {"android/app/ActivityThread", "currentApplication"},
+    {"android/app/AppGlobals", "getInitialApplication"},
+  };
+  for (const auto& s : src) {
+    jclass cls = chk(env, env->FindClass(s[0]));
+    if (!cls) continue;
+    jobject app = nullptr;
+    jmethodID mid = chk(env, env->GetStaticMethodID(cls, s[1], "()Landroid/app/Application;"));
+    if (mid) app = chk(env, env->CallStaticObjectMethod(cls, mid));
+    env->DeleteLocalRef(cls);
+    if (app) return app;
+  }
+  return nullptr;
+}
+
+// hentikan looper setelah toast selesai
+static void* quitLater(void* arg) {
+  jobject looper = static_cast<jobject>(arg);
+  sleep(4);  // toast pendek ~2 detik + margin
+
+  JavaVM* vm = getVm();
+  JNIEnv* env = nullptr;
+  if (!vm || vm->AttachCurrentThread(&env, nullptr) != JNI_OK) return nullptr;
+
+  jmethodID quit = chk(env, env->GetMethodID(env->GetObjectClass(looper), "quit", "()V"));
+  if (quit) env->CallVoidMethod(looper, quit);
+  bad(env);
+  env->DeleteGlobalRef(looper);
+  vm->DetachCurrentThread();
+  return nullptr;
+}
+
+static void runToast(JNIEnv* env, const char* msg) {
+  jclass lp = chk(env, env->FindClass("android/os/Looper"));
+  jclass ts = chk(env, env->FindClass("android/widget/Toast"));
+  jobject ctx = appCtx(env);
+  if (!lp || !ts || !ctx) return;
+
+  jmethodID prep = chk(env, env->GetStaticMethodID(lp, "prepare", "()V"));
+  jmethodID cur = chk(env, env->GetStaticMethodID(lp, "myLooper", "()Landroid/os/Looper;"));
+  jmethodID loop = chk(env, env->GetStaticMethodID(lp, "loop", "()V"));
+  jmethodID make = chk(env, env->GetStaticMethodID(ts, "makeText",
+      "(Landroid/content/Context;Ljava/lang/CharSequence;I)Landroid/widget/Toast;"));
+  jmethodID show = chk(env, env->GetMethodID(ts, "show", "()V"));
+  if (!prep || !cur || !loop || !make || !show) return;
+
+  char buf[128];
+  snprintf(buf, sizeof(buf), "[MODS] %s", msg);
+  jstring text = chk(env, env->NewStringUTF(buf));
+  if (!text) return;
+
+  env->CallStaticVoidMethod(lp, prep);
+  if (bad(env)) return;
+  jobject looper = chk(env, env->CallStaticObjectMethod(lp, cur));
+  jobject toast = chk(env, env->CallStaticObjectMethod(ts, make, ctx, text, 0));
+  if (!looper || !toast) return;
+
+  env->CallVoidMethod(toast, show);
+  if (bad(env)) return;
+
+  jobject ref = env->NewGlobalRef(looper);
+  if (!spawn(quitLater, ref)) {
+    env->DeleteGlobalRef(ref);
+    return;
+  }
+  env->CallStaticVoidMethod(lp, loop);  // kembali setelah quit
+  bad(env);
+}
+
+static void* toastMain(void* arg) {
+  JavaVM* vm = getVm();
+  JNIEnv* env = nullptr;
+  if (vm && vm->AttachCurrentThread(&env, nullptr) == JNI_OK) {
+    runToast(env, static_cast<const char*>(arg));
+    vm->DetachCurrentThread();
+  }
+  return nullptr;
+}
+
+// msg harus string literal
+static void toast(const char* msg) {
+  spawn(toastMain, const_cast<char*>(msg));
+}
+
+// ---- il2cpp ----
+
+template <class T>
+static bool bindFn(T& f, const char* name) {
+  f = reinterpret_cast<T>(dlsym(il.h, name));
+  return f != nullptr;
+}
+
+static bool loadApi() {
+  if (!il.h) il.h = dlopen("libil2cpp.so", RTLD_LAZY);
+  if (!il.h) return false;
+
+  bindFn(il.ptr, "il2cpp_method_get_pointer");
+  return bindFn(il.domain, "il2cpp_domain_get") &&
+         bindFn(il.assemblies, "il2cpp_domain_get_assemblies") &&
+         bindFn(il.image, "il2cpp_assembly_get_image") &&
+         bindFn(il.classCount, "il2cpp_image_get_class_count") &&
+         bindFn(il.classAt, "il2cpp_image_get_class") &&
+         bindFn(il.methods, "il2cpp_class_get_methods") &&
+         bindFn(il.name, "il2cpp_method_get_name") &&
+         bindFn(il.argc, "il2cpp_method_get_param_count") &&
+         bindFn(il.attach, "il2cpp_thread_attach");
+}
+
+// alamat kode method
+static void* codeAddr(void* m) {
+  void* p = il.ptr ? il.ptr(m) : nullptr;
+  if (p) return p;
+  void** f = static_cast<void**>(m);  // fallback, aman 32/64-bit
+  return f[0] ? f[0] : f[1];
+}
+
+static bool validAddr(void* a) {
   Dl_info info;
-  if (!dladdr(addr, &info) || !info.dli_fbase) return false;
-  if (*reinterpret_cast<uint32_t*>(addr) == 0xd65f03c0) return false;
+  if (!a || !dladdr(a, &info) || !info.dli_fbase) return false;
+#if defined(__aarch64__)
+  // lewati fungsi kosong (RET)
+  if (*static_cast<uint32_t*>(a) == 0xd65f03c0) return false;
+#endif
+  // arm32 tidak dicek, opcode return beragam dan alamat thumb ber-bit-0
   return true;
 }
 
-// pindai semua class dan method untuk mencari target
-static void scan() {
-  void* domain = il2cpp.domainGet();
-  if (!domain) return;
+// ---- hook ----
 
-  size_t asmCount = 0;
-  void** assemblies = il2cpp.getAssemblies(domain, &asmCount);
-  if (!assemblies) return;
+static void* debugFn = nullptr;
 
-  for (size_t i = 0; i < asmCount; ++i) {
-    void* image = il2cpp.imageOf(assemblies[i]);
-    if (!image) continue;
-
-    size_t classCount = il2cpp.classCount(image);
-    for (size_t j = 0; j < classCount; ++j) {
-      void* klass = il2cpp.classAt(image, j);
-      if (!klass) continue;
-
-      bool hasInfMarker = false;
-      bool hasAdsMarker = false;
-      void* iter = nullptr;
-      void* method;
-
-      while ((method = il2cpp.methodsOf(klass, &iter))) {
-        const char* name = il2cpp.methodName(method);
-        if (!name) continue;
-
-        int argc = il2cpp.paramCount(method);
-        void* addr = getMethodAddr(method);
-        if (!isValidAddr(addr)) continue;
-
-        if (!strcmp(name, "get_HasInfinityPack")) hasInfMarker = true;
-        if (!strcmp(name, "get_HasDisabledAds")) hasAdsMarker = true;
-
-        if (!targets.initiate && !strcmp(name, "InitiatePurchase") && argc == 1)
-          targets.initiate = addr;
-        else if (!targets.debug && !strcmp(name, "DebugEditorPurchase") && argc == 1)
-          targets.debug = addr;
-        else if (!targets.hasInfinity && !strcmp(name, "get_HasInfinityPack") && argc == 0)
-          targets.hasInfinity = addr;
-        else if (!targets.actualHasInfinity && !strcmp(name, "get_ActualHasInfinityPack") && argc == 0)
-          targets.actualHasInfinity = addr;
-        else if (!targets.hasDisabledAds && !strcmp(name, "get_HasDisabledAds") && argc == 0)
-          targets.hasDisabledAds = addr;
-        else if (!targets.actualHasDisabledAds && !strcmp(name, "get_ActualHasDisabledAds") && argc == 0)
-          targets.actualHasDisabledAds = addr;
-        else if (!targets.mayShowAd && !strcmp(name, "MayShowAnAd") && argc == 0)
-          targets.mayShowAd = addr;
-      }
-
-      // cari fungsi revoke jika marker ditemukan di class ini
-      if (hasInfMarker || hasAdsMarker) {
-        void* iterRevoke = nullptr;
-        while ((method = il2cpp.methodsOf(klass, &iterRevoke))) {
-          const char* name = il2cpp.methodName(method);
-          if (!name || strcmp(name, "Revoke") != 0) continue;
-          
-          int argc = il2cpp.paramCount(method);
-          void* addr = getMethodAddr(method);
-          if (!isValidAddr(addr)) continue;
-
-          if (!targets.revokeWithBool && argc == 1) targets.revokeWithBool = addr;
-          if (!targets.revoke && argc == 0) targets.revoke = addr;
-        }
-      }
-    }
-  }
-}
-
-// fungsi pengganti (hooks)
-typedef void (*DebugFn)(void*);
-
-static bool hookInitiate(void* productId) {
-  if (targets.debug) {
-    reinterpret_cast<DebugFn>(targets.debug)(productId);
-  }
+static bool buy(void* id) {
+  if (debugFn) reinterpret_cast<void (*)(void*)>(debugFn)(id);
+  toast("Simulasi pembelian berhasil");
   return true;
 }
 
@@ -172,70 +226,116 @@ static bool retFalse() { return false; }
 static void noop() {}
 static void noopBool(bool) {}
 
-// pasang semua hook yang ditemukan
-static void installHooks() {
-  #define HOOK_TARGET(field, fn) \
-    if (targets.field) A64HookFunction(targets.field, reinterpret_cast<void*>(fn), nullptr);
+template <class T>
+static void* fp(T f) { return reinterpret_cast<void*>(f); }
 
-  HOOK_TARGET(initiate, hookInitiate);
-  HOOK_TARGET(hasInfinity, retTrue);
-  HOOK_TARGET(actualHasInfinity, retTrue);
-  HOOK_TARGET(hasDisabledAds, retTrue);
-  HOOK_TARGET(actualHasDisabledAds, retTrue);
-  HOOK_TARGET(mayShowAd, retFalse);
-  HOOK_TARGET(revokeWithBool, noopBool);
-  HOOK_TARGET(revoke, noop);
-  
-  #undef HOOK_TARGET
+struct Hook {
+  const char* name;
+  int argc;
+  void* fn;  // pengganti, null = hanya dicari
+  bool mark = false;  // penanda class target
+  bool late = false;  // hanya diambil dari class yang punya penanda
+  void* addr = nullptr;
+};
+
+static constexpr int kDebug = 1;  // indeks DebugEditorPurchase
+
+static Hook hooks[] = {
+  {"InitiatePurchase", 1, fp(buy)},
+  {"DebugEditorPurchase", 1, nullptr},
+  {"get_HasInfinityPack", 0, fp(retTrue), true},
+  {"get_ActualHasInfinityPack", 0, fp(retTrue)},
+  {"get_HasDisabledAds", 0, fp(retTrue), true},
+  {"get_ActualHasDisabledAds", 0, fp(retTrue)},
+  {"MayShowAnAd", 0, fp(retFalse)},
+  {"Revoke", 1, fp(noopBool), false, true},
+  {"Revoke", 0, fp(noop), false, true},
+};
+
+// cocokkan method dengan tabel, true jika method penanda
+static bool take(void* m, bool late) {
+  const char* name = il.name(m);
+  if (!name) return false;
+
+  for (Hook& h : hooks) {
+    if (h.late != late || strcmp(h.name, name) != 0 || h.argc != il.argc(m)) continue;
+    void* a = codeAddr(m);
+    if (!validAddr(a)) return false;
+    if (!h.addr) h.addr = a;
+    return h.mark;
+  }
+  return false;
 }
 
-// thread utama pekerja
+static void scanClass(void* cls) {
+  void* it = nullptr;
+  bool mark = false;
+  while (void* m = il.methods(cls, &it)) mark |= take(m, false);
+  if (!mark) return;
+
+  // Revoke hanya diambil dari class penanda
+  it = nullptr;
+  while (void* m = il.methods(cls, &it)) take(m, true);
+}
+
+static void scan(void* dom) {
+  size_t n = 0;
+  void** as = il.assemblies(dom, &n);
+  for (size_t i = 0; as && i < n; ++i) {
+    void* img = il.image(as[i]);
+    if (!img) continue;
+    size_t cn = il.classCount(img);
+    for (size_t j = 0; j < cn; ++j) {
+      if (void* cls = il.classAt(img, j)) scanClass(cls);
+    }
+  }
+}
+
+// pasang hook (mode unique, orig tidak dipakai), return jumlah berhasil
+// alamat thumb dari il2cpp sudah ber-bit-0, shadowhook membacanya sendiri
+// target il2cpp yang digabung ke satu alamat: hook kedua ditolak, wajar
+static int install() {
+  int n = 0;
+  for (const Hook& h : hooks) {
+    if (h.fn && h.addr && shadowhook_hook_func_addr(h.addr, h.fn, nullptr)) ++n;
+  }
+  return n;
+}
+
+// ---- entry ----
+
 static void* worker(void*) {
-  // tunggu libil2cpp dimuat oleh game
-  for (int i = 0; i < 120; ++i) {
-    if (dlopen("libil2cpp.so", RTLD_LAZY | RTLD_NOLOAD)) break;
-    sleep(1);
-  }
+  if (shadowhook_init(SHADOWHOOK_MODE_UNIQUE, false) != 0) return nullptr;
+
+  // tunggu libil2cpp dimuat
+  waitFor(120, [] { return (il.h = dlopen("libil2cpp.so", RTLD_LAZY | RTLD_NOLOAD)) != nullptr; });
   sleep(2);
+  if (!loadApi()) return nullptr;
 
-  if (!resolveApi()) return nullptr;
+  // tunggu domain siap
+  void* dom = nullptr;
+  if (!waitFor(60, [&] { return (dom = il.domain()) != nullptr; })) return nullptr;
 
-  // tunggu domain il2cpp siap
-  void* domain = nullptr;
-  for (int i = 0; i < 60; ++i) {
-    domain = il2cpp.domainGet();
-    if (domain) break;
-    sleep(1);
-  }
-  
-  if (!domain) return nullptr;
-  
-  il2cpp.threadAttach(domain);
-  scan();
-  installHooks();
-
+  il.attach(dom);
+  scan(dom);
+  debugFn = hooks[kDebug].addr;
+  if (install() > 0) toast("Inisialisasi berhasil");
   return nullptr;
 }
 
-// mulai thread pekerja hanya sekali
 static void start() {
-  bool expected = false;
-  if (!isStarted.compare_exchange_strong(expected, true)) return;
-  
-  pthread_t threadId;
-  if (pthread_create(&threadId, nullptr, worker, nullptr) == 0) {
-    pthread_detach(threadId);
-  }
+  if (!started.exchange(true)) spawn(worker, nullptr);
 }
 
-// entry point jni
-extern "C" jint JNI_OnLoad(JavaVM* vm, void* reserved) {
+// visibility default karena build memakai -fvisibility=hidden
+extern "C" __attribute__((visibility("default")))
+jint JNI_OnLoad(JavaVM* vm, void*) {
+  jvm.store(vm);
   start();
   return JNI_VERSION_1_6;
 }
 
-// entry point native constructor
 __attribute__((constructor))
-static void onNativeLoad() {
+static void onLoad() {
   start();
 }
