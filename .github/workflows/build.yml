@@ -1,42 +1,101 @@
-name: Build SWLMods
+name: Build Native Libraries
 
 on:
   push:
-    branches: [main, master]
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
   workflow_dispatch:
+
+env:
+  SHADOWHOOK_VERSION: "2.0.1"   # rilis terbaru di Maven Central saat ini
+  ANDROID_API: "24"             # minSdk
 
 jobs:
   build:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        abi: [arm64-v8a, armeabi-v7a]
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
-      - name: Setup Android NDK
-        id: ndk
-        uses: nttld/setup-ndk@v1
-        with:
-          ndk-version: r26b
-          add-to-path: false
-
-      - name: Configure CMake
+      - name: Resolve NDK
         run: |
+          NDK="${ANDROID_NDK_LATEST_HOME:-$ANDROID_NDK_HOME}"
+          test -d "$NDK" || { echo "NDK tidak ditemukan"; exit 1; }
+          echo "NDK=$NDK" >> "$GITHUB_ENV"
+          echo "NDK path: $NDK"
+          grep -E "Pkg.Revision" "$NDK/source.properties" || true
+
+      - name: Download ShadowHook AAR
+        run: |
+          set -euo pipefail
+          URL="https://repo1.maven.org/maven2/com/bytedance/android/shadowhook/${SHADOWHOOK_VERSION}/shadowhook-${SHADOWHOOK_VERSION}.aar"
+          curl -fL --retry 3 -o shadowhook.aar "$URL"
+          unzip -q shadowhook.aar -d shadowhook_aar
+
+          HDR="$(find shadowhook_aar -name shadowhook.h | head -n1)"
+          LIB="$(find shadowhook_aar -path "*${{ matrix.abi }}*" -name libshadowhook.so | head -n1)"
+          test -n "$HDR" || { echo "shadowhook.h tidak ditemukan di AAR"; find shadowhook_aar | head -50; exit 1; }
+          test -n "$LIB" || { echo "libshadowhook.so (${{ matrix.abi }}) tidak ditemukan di AAR"; find shadowhook_aar | head -50; exit 1; }
+
+          echo "SHADOWHOOK_INCLUDE_DIR=$(dirname "$(realpath "$HDR")")" >> "$GITHUB_ENV"
+          echo "SHADOWHOOK_LIB=$(realpath "$LIB")" >> "$GITHUB_ENV"
+          echo "Header: $HDR"
+          echo "Lib   : $LIB"
+
+      - name: Configure and build
+        run: |
+          set -euo pipefail
           cmake -S . -B build \
-            -DCMAKE_TOOLCHAIN_FILE=${{ steps.ndk.outputs.ndk-path }}/build/cmake/android.toolchain.cmake \
-            -DANDROID_ABI=arm64-v8a \
-            -DANDROID_PLATFORM=android-24 \
-            -DCMAKE_BUILD_TYPE=Release
+            -DCMAKE_TOOLCHAIN_FILE="$NDK/build/cmake/android.toolchain.cmake" \
+            -DANDROID_ABI=${{ matrix.abi }} \
+            -DANDROID_PLATFORM=android-${ANDROID_API} \
+            -DANDROID_STL=c++_static \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DSHADOWHOOK_INCLUDE_DIR="$SHADOWHOOK_INCLUDE_DIR" \
+            -DSHADOWHOOK_LIB="$SHADOWHOOK_LIB"
+          cmake --build build -j"$(nproc)"
 
-      - name: Build
-        run: cmake --build build --config Release -j$(nproc)
-
-      - name: Collect artifact
+      - name: Prepare artifacts
         run: |
-          mkdir -p dist/arm64-v8a
-          cp build/libfbrian.so dist/arm64-v8a/
-          ls -la dist/arm64-v8a/
+          set -euo pipefail
+          ls -la lib/${{ matrix.abi }}
+          mkdir -p artifact/lib/${{ matrix.abi }}
+          cp lib/${{ matrix.abi }}/libfbrian.so artifact/lib/${{ matrix.abi }}/
+          cp "$SHADOWHOOK_LIB" artifact/lib/${{ matrix.abi }}/libshadowhook.so
+
+      - name: Verify
+        run: |
+          set -euo pipefail
+          READELF="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-readelf"
+          for f in libfbrian.so libshadowhook.so; do
+            echo "== $f =="
+            "$READELF" -h "artifact/lib/${{ matrix.abi }}/$f" | grep -E "Class|Machine"
+            "$READELF" -d "artifact/lib/${{ matrix.abi }}/$f" | grep NEEDED || true
+          done
+          "$READELF" -d "artifact/lib/${{ matrix.abi }}/libfbrian.so" | grep -q "libshadowhook.so" \
+            || { echo "libfbrian.so tidak punya NEEDED libshadowhook.so"; exit 1; }
+          echo "== LOAD alignment libfbrian.so =="
+          "$READELF" -lW "artifact/lib/${{ matrix.abi }}/libfbrian.so" | grep LOAD
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: libfbrian-arm64-v8a
-          path: dist/
+          name: libfbrian-${{ matrix.abi }}
+          path: artifact/
+          if-no-files-found: error
+
+  merge:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Merge ABI artifacts
+        uses: actions/upload-artifact/merge@v4
+        with:
+          name: libfbrian-all
+          pattern: libfbrian-*
+          delete-merged: false
