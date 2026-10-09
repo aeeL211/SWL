@@ -238,7 +238,7 @@ struct Hook {
   void* addr = nullptr;
 };
 
-static constexpr int kDebug = 1;  // indeks DebugEditorPurchase
+static constexpr int kDbgFn = 1;  // indeks DebugEditorPurchase
 
 static Hook hooks[] = {
   {"InitiatePurchase", 1, fp(buy)},
@@ -304,22 +304,60 @@ static int install() {
 
 // ---- entry ----
 
+// build debug (-DMODS_DEBUG=ON): toast per tahap dan log internal shadowhook
+#ifdef MODS_DEBUG
+static constexpr bool verbose = true;
+#define dbg(msg) toast("debug: " msg)
+#else
+static constexpr bool verbose = false;
+#define dbg(msg) ((void)0)
+#endif
+
+// jumlah target yang ketemu
+static int found() {
+  int n = 0;
+  for (const Hook& h : hooks) n += (h.fn && h.addr) ? 1 : 0;
+  return n;
+}
+
 static void* worker(void*) {
-  if (shadowhook_init(SHADOWHOOK_MODE_UNIQUE, false) != 0) return nullptr;
+  if (shadowhook_init(SHADOWHOOK_MODE_UNIQUE, verbose) != 0) {
+    dbg("shadowhook init gagal");
+    return nullptr;
+  }
+  dbg("shadowhook siap");
 
   // tunggu libil2cpp dimuat
-  waitFor(120, [] { return (il.h = dlopen("libil2cpp.so", RTLD_LAZY | RTLD_NOLOAD)) != nullptr; });
+  if (!waitFor(120, [] { return (il.h = dlopen("libil2cpp.so", RTLD_LAZY | RTLD_NOLOAD)) != nullptr; })) {
+    dbg("libil2cpp belum termuat");
+  }
   sleep(2);
-  if (!loadApi()) return nullptr;
+  if (!loadApi()) {
+    dbg("api il2cpp gagal");
+    return nullptr;
+  }
 
   // tunggu domain siap
   void* dom = nullptr;
-  if (!waitFor(60, [&] { return (dom = il.domain()) != nullptr; })) return nullptr;
+  if (!waitFor(60, [&] { return (dom = il.domain()) != nullptr; })) {
+    dbg("domain il2cpp gagal");
+    return nullptr;
+  }
 
+  // scan ulang sampai target ketemu, assembly bisa belum siap
   il.attach(dom);
-  scan(dom);
-  debugFn = hooks[kDebug].addr;
-  if (install() > 0) toast("Inisialisasi berhasil");
+  waitFor(30, [&] { scan(dom); return found() > 0; });
+  if (found() == 0) {
+    dbg("target tidak ditemukan");
+    return nullptr;
+  }
+
+  debugFn = hooks[kDbgFn].addr;
+  if (install() > 0) {
+    toast("Inisialisasi berhasil");
+  } else {
+    dbg("hook gagal dipasang");
+  }
   return nullptr;
 }
 
