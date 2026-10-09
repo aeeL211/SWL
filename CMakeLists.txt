@@ -4,33 +4,33 @@ project(SWLMods CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+include(CheckIPOSupported)
+check_ipo_supported(RESULT ipo_supported)
+if(ipo_supported)
+    set(CMAKE_INTERPROCEDURAL_OPTIMIZATION TRUE)
+endif()
+
 if(NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE Release)
 endif()
 
-include(FetchContent)
-FetchContent_Declare(
-  and64inlinehook
-  GIT_REPOSITORY https://github.com/Rprop/And64InlineHook.git
-  GIT_TAG        master
-  GIT_SHALLOW    TRUE
-)
-FetchContent_MakeAvailable(and64inlinehook)
-
-add_library(fbrian SHARED main.cpp)
-
-target_include_directories(fbrian PRIVATE
-  ${and64inlinehook_SOURCE_DIR}
+add_library(fbrian SHARED 
+  main.cpp
+  And64InlineHook.cpp
 )
 
-target_sources(fbrian PRIVATE
-  ${and64inlinehook_SOURCE_DIR}/And64InlineHook.cpp
-)
+target_include_directories(fbrian PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 
 target_compile_options(fbrian PRIVATE
-  -Os
+  -Oz
+  -flto
   -fno-exceptions
   -fno-rtti
+  -fno-unwind-tables
+  -fno-asynchronous-unwind-tables
+  -fno-stack-protector
+  -fno-ident
+  -fomit-frame-pointer
   -ffunction-sections
   -fdata-sections
   -fvisibility=hidden
@@ -38,16 +38,16 @@ target_compile_options(fbrian PRIVATE
 )
 
 target_link_options(fbrian PRIVATE
+  -flto
   -Wl,--gc-sections
+  -Wl,--icf=all
   -Wl,--strip-all
   -Wl,--exclude-libs,ALL
+  -Wl,--build-id=none
+  -Wl,--hash-style=gnu
 )
 
-target_link_libraries(fbrian PRIVATE
-  log
-  android
-  dl
-)
+target_link_libraries(fbrian PRIVATE dl)
 
 set_target_properties(fbrian PROPERTIES
   CXX_VISIBILITY_PRESET hidden
