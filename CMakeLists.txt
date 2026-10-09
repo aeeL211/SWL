@@ -15,6 +15,10 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(shadowhook)
 
+target_compile_options(shadowhook PRIVATE -Wno-error)
+target_compile_options(shadowhook PRIVATE -Wno-declaration-after-statement)
+target_compile_options(shadowhook PRIVATE -Wno-unsafe-buffer-usage)
+
 add_library(fbrian SHARED main.cpp)
 
 target_include_directories(fbrian PRIVATE
