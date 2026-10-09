@@ -6,7 +6,7 @@
 #include <cstring>
 #include <cstdint>
 
-#include "shadowhook.h"
+#include "And64InlineHook.hpp"
 
 #define TAG "SWLMods"
 #define logI(...) __android_log_print(ANDROID_LOG_INFO,  TAG, __VA_ARGS__)
@@ -165,11 +165,10 @@ static void findIapClass() {
 
 typedef void (*VoidPtrFn)(void*);
 
-static bool hookInitiate(void* productId) {
+static void hookInitiate(void* productId) {
   if (tgt.debug)
     reinterpret_cast<VoidPtrFn>(tgt.debug)(productId);
   showToast("MODS: Pembelian berhasil disimulasikan.");
-  return true;
 }
 
 static bool retTrue()      { return true;  }
@@ -179,10 +178,8 @@ static void noopBool(bool) {}
 
 static void installHooks() {
 #define hook(field, fn) do { if (tgt.field) { \
-    void* stub = nullptr; \
-    int rc = shadowhook_hook_func_addr(tgt.field, reinterpret_cast<void*>(fn), &stub); \
-    if (rc == 0) logI("[Hook] " #field " OK"); \
-    else         logE("[Hook] " #field " gagal rc=%d", rc); \
+    A64HookFunction(tgt.field, reinterpret_cast<void*>(fn), nullptr); \
+    logI("[Hook] " #field " OK"); \
   } } while (0)
 
   hook(initiate,             hookInitiate);
@@ -203,10 +200,6 @@ static void* worker(void*) {
   }
   sleep(2);
 
-  if (shadowhook_init(SHADOWHOOK_MODE_UNIQUE, false) != 0) {
-    logE("[Fatal] shadowhook_init gagal");
-    return nullptr;
-  }
   if (!resolveIl2cpp()) { logE("[Fatal] Gagal resolve il2cpp"); return nullptr; }
 
   void* domain = il.domainGet();
