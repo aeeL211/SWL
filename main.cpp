@@ -64,9 +64,9 @@ static JNIEnv* attachEnv() {
   return env;
 }
 
-static FILE*     g_logFile = nullptr;
+static FILE*      g_logFile = nullptr;
 static std::mutex g_logMutex;
-static char      g_logPath[512] = {0};
+static char       g_logPath[512] = {0};
 
 static FILE* openLogFile() {
   if (g_logFile) return g_logFile;
@@ -107,6 +107,15 @@ static FILE* openLogFile() {
   env->ReleaseStringUTFChars(jpath, cpath);
 
   g_logFile = fopen(g_logPath, "a");
+  if (g_logFile) {
+    time_t now = time(nullptr);
+    struct tm tmBuf;
+    localtime_r(&now, &tmBuf);
+    char ts[32];
+    strftime(ts, sizeof(ts), "%H:%M:%S", &tmBuf);
+    fprintf(g_logFile, "[%s] I Log dibuka: %s\n", ts, g_logPath);
+    fflush(g_logFile);
+  }
   return g_logFile;
 }
 
@@ -159,11 +168,6 @@ static void showToast(const char* msg) {
   jmethodID show = env->GetMethodID(toastCls, "show", "()V");
   if (!show) return;
   env->CallVoidMethod(toast, show);
-}
-
-static void maybeShowInitToast() {
-  if (g_initToastDone.exchange(true)) return;
-  showToast("MODS: Inisialisasi berhasil.");
 }
 
 static bool resolveIl2cpp() {
@@ -289,17 +293,16 @@ static void scanAllTargets() {
 typedef void (*VoidPtrFn)(void*);
 
 static bool hookInitiate(void* productId) {
-  maybeShowInitToast();
   if (tgt.debug)
     reinterpret_cast<VoidPtrFn>(tgt.debug)(productId);
   showToast("MODS: Pembelian berhasil disimulasikan.");
   return true;
 }
 
-static bool retTrue()      { maybeShowInitToast(); return true;  }
-static bool retFalse()     { maybeShowInitToast(); return false; }
-static void noop()         { maybeShowInitToast(); }
-static void noopBool(bool) { maybeShowInitToast(); }
+static bool retTrue()      { return true;  }
+static bool retFalse()     { return false; }
+static void noop()         {}
+static void noopBool(bool) {}
 
 static void installHooks() {
 #define hook(field, fn) do { if (tgt.field) { \
@@ -325,7 +328,7 @@ static void* worker(void*) {
   }
   sleep(2);
 
-  logI("Memulai inisialisasi, log: %s", g_logPath[0] ? g_logPath : "(belum tersedia)");
+  logI("Memulai inisialisasi.");
 
   if (!resolveIl2cpp()) { logE("[Fatal] Gagal resolve il2cpp"); return nullptr; }
 
@@ -342,6 +345,29 @@ static void* worker(void*) {
   installHooks();
 
   logI("[Info] Inisialisasi selesai.");
+
+  JNIEnv* env = attachEnv();
+  if (!env) return nullptr;
+
+  jclass looperCls = env->FindClass("android/os/Looper");
+  if (!looperCls) return nullptr;
+
+  jmethodID myLooper = env->GetStaticMethodID(looperCls, "myLooper",
+    "()Landroid/os/Looper;");
+  jobject looper = myLooper ? env->CallStaticObjectMethod(looperCls, myLooper)
+                            : nullptr;
+
+  if (!looper) {
+    jmethodID prepare = env->GetStaticMethodID(looperCls, "prepare", "()V");
+    if (prepare) env->CallStaticVoidMethod(looperCls, prepare);
+  }
+
+  showToast("MODS: Inisialisasi berhasil.");
+  g_initToastDone.store(true);
+
+  jmethodID loop = env->GetStaticMethodID(looperCls, "loop", "()V");
+  if (loop) env->CallStaticVoidMethod(looperCls, loop);
+
   return nullptr;
 }
 
