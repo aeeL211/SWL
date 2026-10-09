@@ -8,6 +8,14 @@
 #include <cstring>
 #include <shadowhook.h>
 
+#ifdef MODS_DEBUG
+#include <android/api-level.h>
+#include <sys/stat.h>
+#include <sys/syscall.h>
+#include <cstdarg>
+#include <ctime>
+#endif
+
 // api il2cpp
 struct Api {
   void* h;
@@ -21,11 +29,34 @@ struct Api {
   int (*argc)(void*);
   void* (*attach)(void*);
   void* (*ptr)(void*);  // opsional
+  const char* (*className)(void*);  // hanya untuk log
+  const char* (*imageName)(void*);  // hanya untuk log
 };
 
 static Api il = {};
 static std::atomic<bool> started{false};
 static std::atomic<JavaVM*> jvm{nullptr};
+
+// build debug (-DMODS_DEBUG=ON): log ke file, toast per tahap, log internal shadowhook
+// log: <external files dir>/fbrian.log (Android/data/<paket>/files)
+#ifdef MODS_DEBUG
+static constexpr bool verbose = true;
+static void lg(const char* fmt, ...) __attribute__((format(printf, 1, 2)));
+static void lgEx(JNIEnv* env);
+#define dbg(msg) toast("debug: " msg)
+#else
+static constexpr bool verbose = false;
+#define lg(...) ((void)0)
+#define lgEx(env) ((void)0)
+#define lgInit() ((void)0)
+#define lgMaps() ((void)0)
+#define lgBind() ((void)0)
+#define lgImage(img, n) ((void)0)
+#define lgProbe(cls, m) ((void)0)
+#define lgTarget(name, argc, a) ((void)0)
+#define lgMissing() ((void)0)
+#define dbg(msg) ((void)0)
+#endif
 
 // jalankan fungsi di thread detached
 static bool spawn(void* (*fn)(void*), void* arg) {
@@ -71,6 +102,7 @@ static JavaVM* getVm() {
 // true jika ada exception jni (dibersihkan)
 static bool bad(JNIEnv* env) {
   if (!env->ExceptionCheck()) return false;
+  lgEx(env);
   env->ExceptionClear();
   return true;
 }
@@ -94,6 +126,7 @@ static jobject appCtx(JNIEnv* env) {
     jmethodID mid = chk(env, env->GetStaticMethodID(cls, s[1], "()Landroid/app/Application;"));
     if (mid) app = chk(env, env->CallStaticObjectMethod(cls, mid));
     env->DeleteLocalRef(cls);
+    lg("appCtx %s.%s = %p", s[0], s[1], static_cast<void*>(app));
     if (app) return app;
   }
   return nullptr;
@@ -120,7 +153,10 @@ static void runToast(JNIEnv* env, const char* msg) {
   jclass lp = chk(env, env->FindClass("android/os/Looper"));
   jclass ts = chk(env, env->FindClass("android/widget/Toast"));
   jobject ctx = appCtx(env);
-  if (!lp || !ts || !ctx) return;
+  if (!lp || !ts || !ctx) {
+    lg("toast: gagal lp=%p ts=%p ctx=%p", static_cast<void*>(lp), static_cast<void*>(ts), static_cast<void*>(ctx));
+    return;
+  }
 
   jmethodID prep = chk(env, env->GetStaticMethodID(lp, "prepare", "()V"));
   jmethodID cur = chk(env, env->GetStaticMethodID(lp, "myLooper", "()Landroid/os/Looper;"));
@@ -128,7 +164,10 @@ static void runToast(JNIEnv* env, const char* msg) {
   jmethodID make = chk(env, env->GetStaticMethodID(ts, "makeText",
       "(Landroid/content/Context;Ljava/lang/CharSequence;I)Landroid/widget/Toast;"));
   jmethodID show = chk(env, env->GetMethodID(ts, "show", "()V"));
-  if (!prep || !cur || !loop || !make || !show) return;
+  if (!prep || !cur || !loop || !make || !show) {
+    lg("toast: method jni tidak ketemu");
+    return;
+  }
 
   char buf[128];
   snprintf(buf, sizeof(buf), "[MODS] %s", msg);
@@ -136,13 +175,23 @@ static void runToast(JNIEnv* env, const char* msg) {
   if (!text) return;
 
   env->CallStaticVoidMethod(lp, prep);
-  if (bad(env)) return;
+  if (bad(env)) {
+    lg("toast: Looper.prepare gagal");
+    return;
+  }
   jobject looper = chk(env, env->CallStaticObjectMethod(lp, cur));
   jobject toast = chk(env, env->CallStaticObjectMethod(ts, make, ctx, text, 0));
-  if (!looper || !toast) return;
+  if (!looper || !toast) {
+    lg("toast: makeText gagal looper=%p toast=%p", static_cast<void*>(looper), static_cast<void*>(toast));
+    return;
+  }
 
   env->CallVoidMethod(toast, show);
-  if (bad(env)) return;
+  if (bad(env)) {
+    lg("toast: show gagal");
+    return;
+  }
+  lg("toast: tampil \"%s\"", buf);
 
   jobject ref = env->NewGlobalRef(looper);
   if (!spawn(quitLater, ref)) {
@@ -159,6 +208,8 @@ static void* toastMain(void* arg) {
   if (vm && vm->AttachCurrentThread(&env, nullptr) == JNI_OK) {
     runToast(env, static_cast<const char*>(arg));
     vm->DetachCurrentThread();
+  } else {
+    lg("toast: jvm=%p, attach gagal", static_cast<void*>(vm));
   }
   return nullptr;
 }
@@ -173,13 +224,18 @@ static void toast(const char* msg) {
 template <class T>
 static bool bindFn(T& f, const char* name) {
   f = reinterpret_cast<T>(dlsym(il.h, name));
+  if (!f) lg("sym tidak ada: %s", name);
   return f != nullptr;
 }
 
 static bool loadApi() {
   if (!il.h) il.h = dlopen("libil2cpp.so", RTLD_LAZY);
-  if (!il.h) return false;
+  if (!il.h) {
+    lg("dlopen libil2cpp gagal: %s", dlerror());
+    return false;
+  }
 
+  lgBind();
   bindFn(il.ptr, "il2cpp_method_get_pointer");
   return bindFn(il.domain, "il2cpp_domain_get") &&
          bindFn(il.assemblies, "il2cpp_domain_get_assemblies") &&
@@ -252,6 +308,190 @@ static Hook hooks[] = {
   {"Revoke", 0, fp(noop), false, true},
 };
 
+// jumlah target yang ketemu
+static int found() {
+  int n = 0;
+  for (const Hook& h : hooks) n += (h.fn && h.addr) ? 1 : 0;
+  return n;
+}
+
+// ---- log debug ----
+#ifdef MODS_DEBUG
+
+static char logPath[600];
+
+static void lg(const char* fmt, ...) {
+  if (!logPath[0]) return;
+  static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER;
+  pthread_mutex_lock(&mu);
+  if (FILE* f = fopen(logPath, "a")) {
+    timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    tm t;
+    localtime_r(&ts.tv_sec, &t);
+    fprintf(f, "%02d:%02d:%02d.%03d [%ld] ", t.tm_hour, t.tm_min, t.tm_sec,
+            static_cast<int>(ts.tv_nsec / 1000000), syscall(SYS_gettid));
+    va_list ap;
+    va_start(ap, fmt);
+    vfprintf(f, fmt, ap);
+    va_end(ap);
+    fputc('\n', f);
+    fclose(f);
+  }
+  pthread_mutex_unlock(&mu);
+}
+
+// catat exception jni lalu bersihkan
+static void lgEx(JNIEnv* env) {
+  jthrowable ex = env->ExceptionOccurred();
+  env->ExceptionClear();
+  if (!ex) return;
+
+  jclass c = env->FindClass("java/lang/Throwable");
+  jmethodID m = c ? env->GetMethodID(c, "toString", "()Ljava/lang/String;") : nullptr;
+  jstring s = m ? static_cast<jstring>(env->CallObjectMethod(ex, m)) : nullptr;
+  const char* t = s ? env->GetStringUTFChars(s, nullptr) : nullptr;
+  lg("jni exception: %s", t ? t : "?");
+  if (t) env->ReleaseStringUTFChars(s, t);
+  env->ExceptionClear();
+}
+
+// folder files eksternal dari Context
+static bool dirFromJni(char* out, size_t n) {
+  JavaVM* vm = getVm();
+  JNIEnv* env = nullptr;
+  if (!vm || vm->AttachCurrentThread(&env, nullptr) != JNI_OK) return false;
+
+  bool ok = false;
+  if (jobject ctx = appCtx(env)) {
+    jmethodID get = chk(env, env->GetMethodID(env->GetObjectClass(ctx), "getExternalFilesDir",
+        "(Ljava/lang/String;)Ljava/io/File;"));
+    jobject file = get ? chk(env, env->CallObjectMethod(ctx, get, static_cast<jstring>(nullptr))) : nullptr;
+    jmethodID path = file ? chk(env, env->GetMethodID(env->GetObjectClass(file), "getAbsolutePath",
+        "()Ljava/lang/String;")) : nullptr;
+    jstring str = path ? static_cast<jstring>(chk(env, env->CallObjectMethod(file, path))) : nullptr;
+    if (str) {
+      const char* c = env->GetStringUTFChars(str, nullptr);
+      snprintf(out, n, "%s", c);
+      env->ReleaseStringUTFChars(str, c);
+      ok = true;
+    }
+  }
+  vm->DetachCurrentThread();
+  return ok;
+}
+
+// fallback: nama paket dari nama proses
+static void dirFromProc(char* out, size_t n) {
+  char pkg[256] = {};
+  if (FILE* f = fopen("/proc/self/cmdline", "r")) {
+    size_t r = fread(pkg, 1, sizeof(pkg) - 1, f);
+    pkg[r] = 0;
+    fclose(f);
+  }
+  if (char* c = strchr(pkg, ':')) *c = 0;
+  snprintf(out, n, "/storage/emulated/0/Android/data/%s/files", pkg);
+}
+
+static void mkdirs(const char* path) {
+  char tmp[512];
+  snprintf(tmp, sizeof(tmp), "%s", path);
+  for (char* p = tmp + 1; *p; ++p) {
+    if (*p != '/') continue;
+    *p = 0;
+    mkdir(tmp, 0775);
+    *p = '/';
+  }
+  mkdir(tmp, 0775);
+}
+
+static void lgInit() {
+  bool onLoad = jvm.load() != nullptr;
+  char dir[2][512] = {};
+  bool viaJni = dirFromJni(dir[0], sizeof(dir[0]));
+  dirFromProc(dir[1], sizeof(dir[1]));
+
+  for (int i = viaJni ? 0 : 1; i < 2; ++i) {
+    mkdirs(dir[i]);
+    snprintf(logPath, sizeof(logPath), "%s/fbrian.log", dir[i]);
+    if (FILE* f = fopen(logPath, "w")) {  // mulai baru tiap proses
+      fclose(f);
+      break;
+    }
+    logPath[0] = 0;
+  }
+  if (!logPath[0]) {
+    toast("debug: file log gagal dibuat");
+    return;
+  }
+
+  lg("=== fbrian debug pid=%d arch=%s api=%d JNI_OnLoad=%d dirDariJni=%d", getpid(),
+     sizeof(void*) == 8 ? "arm64" : "arm32", android_get_device_api_level(), onLoad, viaJni);
+  lg("log: %s", logPath);
+}
+
+// daftar lib penting yang termuat
+static void lgMaps() {
+  FILE* f = fopen("/proc/self/maps", "r");
+  if (!f) return;
+  char line[640];
+  while (fgets(line, sizeof(line), f)) {
+    if (!strstr(line, "r-xp")) continue;
+    if (!strstr(line, "libil2cpp") && !strstr(line, "libunity") && !strstr(line, "libmain") &&
+        !strstr(line, "libfbrian") && !strstr(line, "libshadowhook")) continue;
+    line[strcspn(line, "\n")] = 0;
+    lg("maps: %s", line);
+  }
+  fclose(f);
+}
+
+// fungsi opsional untuk nama class dan image
+static void lgBind() {
+  bindFn(il.className, "il2cpp_class_get_name");
+  bindFn(il.imageName, "il2cpp_image_get_name");
+}
+
+static void lgImage(void* img, size_t classes) {
+  static int calls = 0;
+  if (calls++ >= 300) return;
+  lg("image %s classes=%zu", il.imageName ? il.imageName(img) : "?", classes);
+}
+
+// catat method yang namanya mirip target, untuk cek nama yang berubah
+static void lgProbe(void* cls, void* m) {
+  static int calls = 0;
+  const char* n = il.name(m);
+  if (!n || calls >= 300) return;
+
+  static const char* const keys[] = {"Purchase", "Infinity", "DisabledAds", "Revoke", "ShowAnAd"};
+  for (const char* k : keys) {
+    if (!strstr(n, k)) continue;
+    ++calls;
+    lg("probe: %s::%s argc=%d", il.className ? il.className(cls) : "?", n, il.argc(m));
+    return;
+  }
+}
+
+static void lgTarget(const char* name, int argc, void* a) {
+  Dl_info i;
+  if (dladdr(a, &i) && i.dli_fbase) {
+    lg("target %s/%d @%p (%s+0x%zx)", name, argc, a, i.dli_fname,
+       reinterpret_cast<uintptr_t>(a) - reinterpret_cast<uintptr_t>(i.dli_fbase));
+  } else {
+    lg("target %s/%d @%p", name, argc, a);
+  }
+}
+
+static void lgMissing() {
+  for (const Hook& h : hooks) {
+    if (h.fn && !h.addr) lg("tidak ketemu: %s/%d", h.name, h.argc);
+  }
+}
+
+#endif  // MODS_DEBUG
+
+// ---- scan ----
+
 // cocokkan method dengan tabel, true jika method penanda
 static bool take(void* m, bool late) {
   const char* name = il.name(m);
@@ -260,8 +500,14 @@ static bool take(void* m, bool late) {
   for (Hook& h : hooks) {
     if (h.late != late || strcmp(h.name, name) != 0 || h.argc != il.argc(m)) continue;
     void* a = codeAddr(m);
-    if (!validAddr(a)) return false;
-    if (!h.addr) h.addr = a;
+    if (!validAddr(a)) {
+      lg("tolak %s/%d @%p", name, h.argc, a);
+      return false;
+    }
+    if (!h.addr) {
+      h.addr = a;
+      lgTarget(h.name, h.argc, a);
+    }
     return h.mark;
   }
   return false;
@@ -270,7 +516,10 @@ static bool take(void* m, bool late) {
 static void scanClass(void* cls) {
   void* it = nullptr;
   bool mark = false;
-  while (void* m = il.methods(cls, &it)) mark |= take(m, false);
+  while (void* m = il.methods(cls, &it)) {
+    mark |= take(m, false);
+    lgProbe(cls, m);
+  }
   if (!mark) return;
 
   // Revoke hanya diambil dari class penanda
@@ -281,14 +530,17 @@ static void scanClass(void* cls) {
 static void scan(void* dom) {
   size_t n = 0;
   void** as = il.assemblies(dom, &n);
+  lg("scan: assemblies=%zu", n);
   for (size_t i = 0; as && i < n; ++i) {
     void* img = il.image(as[i]);
     if (!img) continue;
     size_t cn = il.classCount(img);
+    lgImage(img, cn);
     for (size_t j = 0; j < cn; ++j) {
       if (void* cls = il.classAt(img, j)) scanClass(cls);
     }
   }
+  lg("scan: ketemu=%d", found());
 }
 
 // pasang hook (mode unique, orig tidak dipakai), return jumlah berhasil
@@ -297,41 +549,35 @@ static void scan(void* dom) {
 static int install() {
   int n = 0;
   for (const Hook& h : hooks) {
-    if (h.fn && h.addr && shadowhook_hook_func_addr(h.addr, h.fn, nullptr)) ++n;
+    if (!h.fn || !h.addr) continue;
+    void* stub = shadowhook_hook_func_addr(h.addr, h.fn, nullptr);
+    lg("hook %s/%d @%p -> %s", h.name, h.argc, h.addr,
+       stub ? "ok" : shadowhook_to_errmsg(shadowhook_get_errno()));
+    if (stub) ++n;
   }
   return n;
 }
 
 // ---- entry ----
 
-// build debug (-DMODS_DEBUG=ON): toast per tahap dan log internal shadowhook
-#ifdef MODS_DEBUG
-static constexpr bool verbose = true;
-#define dbg(msg) toast("debug: " msg)
-#else
-static constexpr bool verbose = false;
-#define dbg(msg) ((void)0)
-#endif
-
-// jumlah target yang ketemu
-static int found() {
-  int n = 0;
-  for (const Hook& h : hooks) n += (h.fn && h.addr) ? 1 : 0;
-  return n;
-}
-
 static void* worker(void*) {
-  if (shadowhook_init(SHADOWHOOK_MODE_UNIQUE, verbose) != 0) {
+  lgInit();
+  lgMaps();
+
+  int r = shadowhook_init(SHADOWHOOK_MODE_UNIQUE, verbose);
+  lg("shadowhook_init=%d (%s) jvm=%p", r, shadowhook_to_errmsg(r), static_cast<void*>(getVm()));
+  if (r != 0) {
     dbg("shadowhook init gagal");
     return nullptr;
   }
   dbg("shadowhook siap");
 
   // tunggu libil2cpp dimuat
-  if (!waitFor(120, [] { return (il.h = dlopen("libil2cpp.so", RTLD_LAZY | RTLD_NOLOAD)) != nullptr; })) {
-    dbg("libil2cpp belum termuat");
-  }
+  bool lib = waitFor(120, [] { return (il.h = dlopen("libil2cpp.so", RTLD_LAZY | RTLD_NOLOAD)) != nullptr; });
+  lg("libil2cpp termuat=%d handle=%p", lib, il.h);
+  if (!lib) dbg("libil2cpp belum termuat");
   sleep(2);
+  lgMaps();
   if (!loadApi()) {
     dbg("api il2cpp gagal");
     return nullptr;
@@ -339,7 +585,9 @@ static void* worker(void*) {
 
   // tunggu domain siap
   void* dom = nullptr;
-  if (!waitFor(60, [&] { return (dom = il.domain()) != nullptr; })) {
+  bool domOk = waitFor(60, [&] { return (dom = il.domain()) != nullptr; });
+  lg("domain=%p", dom);
+  if (!domOk) {
     dbg("domain il2cpp gagal");
     return nullptr;
   }
@@ -347,6 +595,7 @@ static void* worker(void*) {
   // scan ulang sampai target ketemu, assembly bisa belum siap
   il.attach(dom);
   waitFor(30, [&] { scan(dom); return found() > 0; });
+  lgMissing();
   if (found() == 0) {
     dbg("target tidak ditemukan");
     return nullptr;
