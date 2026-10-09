@@ -19,6 +19,8 @@ target_compile_options(shadowhook PRIVATE -Wno-error)
 target_compile_options(shadowhook PRIVATE -Wno-declaration-after-statement)
 target_compile_options(shadowhook PRIVATE -Wno-unsafe-buffer-usage)
 
+target_link_options(shadowhook PRIVATE -Wl,--undefined-version)
+
 add_library(fbrian SHARED main.cpp)
 
 target_include_directories(fbrian PRIVATE
