@@ -5,12 +5,21 @@
 #include <unistd.h>
 #include <cstring>
 #include <cstdint>
+#include <cstdio>
+#include <cstdarg>
+#include <ctime>
+#include <mutex>
+#include <atomic>
 
 #include "And64InlineHook.hpp"
 
 #define TAG "SWLMods"
-#define logI(...) __android_log_print(ANDROID_LOG_INFO,  TAG, __VA_ARGS__)
-#define logE(...) __android_log_print(ANDROID_LOG_ERROR, TAG, __VA_ARGS__)
+
+static void logWrite(const char* level, const char* fmt, ...)
+  __attribute__((format(printf, 2, 3)));
+
+#define logI(...) logWrite("I", __VA_ARGS__)
+#define logE(...) logWrite("E", __VA_ARGS__)
 
 struct Il2cpp {
   void*       handle;
@@ -40,8 +49,10 @@ struct Targets {
 
 static Il2cpp  il       = {};
 static Targets tgt      = {};
-static void*   iapClass = nullptr;
 static JavaVM* gVm      = nullptr;
+
+static std::atomic<bool> g_started{false};
+static std::atomic<bool> g_initToastDone{false};
 
 static JNIEnv* attachEnv() {
   if (!gVm) return nullptr;
@@ -51,6 +62,74 @@ static JNIEnv* attachEnv() {
     if (gVm->AttachCurrentThread(&env, nullptr) != JNI_OK) return nullptr;
   } else if (r != JNI_OK) return nullptr;
   return env;
+}
+
+static FILE*     g_logFile = nullptr;
+static std::mutex g_logMutex;
+static char      g_logPath[512] = {0};
+
+static FILE* openLogFile() {
+  if (g_logFile) return g_logFile;
+
+  JNIEnv* env = attachEnv();
+  if (!env) return nullptr;
+
+  jclass thread = env->FindClass("android/app/ActivityThread");
+  if (!thread) return nullptr;
+
+  jmethodID cur = env->GetStaticMethodID(thread, "currentApplication",
+    "()Landroid/app/Application;");
+  if (!cur) return nullptr;
+  jobject app = env->CallStaticObjectMethod(thread, cur);
+  if (!app) return nullptr;
+
+  jclass ctxCls = env->FindClass("android/content/Context");
+  if (!ctxCls) return nullptr;
+  jmethodID getDir = env->GetMethodID(ctxCls, "getExternalFilesDir",
+    "(Ljava/lang/String;)Ljava/io/File;");
+  if (!getDir) return nullptr;
+
+  jobject dir = env->CallObjectMethod(app, getDir, nullptr);
+  if (!dir) return nullptr;
+
+  jclass fileCls = env->FindClass("java/io/File");
+  if (!fileCls) return nullptr;
+  jmethodID getPath = env->GetMethodID(fileCls, "getAbsolutePath",
+    "()Ljava/lang/String;");
+  if (!getPath) return nullptr;
+
+  jstring jpath = (jstring)env->CallObjectMethod(dir, getPath);
+  if (!jpath) return nullptr;
+  const char* cpath = env->GetStringUTFChars(jpath, nullptr);
+  if (!cpath) return nullptr;
+
+  snprintf(g_logPath, sizeof(g_logPath), "%s/swlmods.log", cpath);
+  env->ReleaseStringUTFChars(jpath, cpath);
+
+  g_logFile = fopen(g_logPath, "a");
+  return g_logFile;
+}
+
+static void logWrite(const char* level, const char* fmt, ...) {
+  std::lock_guard<std::mutex> lk(g_logMutex);
+
+  FILE* f = openLogFile();
+  if (!f) return;
+
+  time_t now = time(nullptr);
+  struct tm tmBuf;
+  localtime_r(&now, &tmBuf);
+  char ts[32];
+  strftime(ts, sizeof(ts), "%H:%M:%S", &tmBuf);
+
+  char msg[1024];
+  va_list ap;
+  va_start(ap, fmt);
+  vsnprintf(msg, sizeof(msg), fmt, ap);
+  va_end(ap);
+
+  fprintf(f, "[%s] %s %s\n", ts, level, msg);
+  fflush(f);
 }
 
 static void showToast(const char* msg) {
@@ -82,54 +161,9 @@ static void showToast(const char* msg) {
   env->CallVoidMethod(toast, show);
 }
 
-static void toastOnMain(const char* msg) {
-  JNIEnv* env = attachEnv();
-  if (!env) return;
-
-  jclass handlerCls = env->FindClass("android/os/Handler");
-  if (!handlerCls) return;
-  jclass looperCls = env->FindClass("android/os/Looper");
-  if (!looperCls) return;
-
-  jmethodID getMain = env->GetStaticMethodID(looperCls, "getMainLooper",
-    "()Landroid/os/Looper;");
-  if (!getMain) return;
-  jobject looper = env->CallStaticObjectMethod(looperCls, getMain);
-  if (!looper) return;
-
-  jmethodID ctor = env->GetMethodID(handlerCls, "<init>", "(Landroid/os/Looper;)V");
-  if (!ctor) return;
-  jobject handler = env->NewObject(handlerCls, ctor, looper);
-  if (!handler) return;
-
-  jclass runnableCls = env->FindClass("java/lang/Runnable");
-  if (!runnableCls) return;
-
-  jstring jmsg = env->NewStringUTF(msg);
-
-  jclass toastCls = env->FindClass("android/widget/Toast");
-  jmethodID makeText = env->GetStaticMethodID(toastCls, "makeText",
-    "(Landroid/content/Context;Ljava/lang/CharSequence;I)Landroid/widget/Toast;");
-
-  jclass thread = env->FindClass("android/app/ActivityThread");
-  jmethodID cur = env->GetStaticMethodID(thread, "currentApplication",
-    "()Landroid/app/Application;");
-  jobject app = env->CallStaticObjectMethod(thread, cur);
-
-  if (!app || !makeText) return;
-
-  jobject toast = env->CallStaticObjectMethod(toastCls, makeText, app, jmsg, 0);
-  env->DeleteLocalRef(jmsg);
-  if (!toast) return;
-  jmethodID show = env->GetMethodID(toastCls, "show", "()V");
-
-  // Bungkus dalam Runnable sederhana pakai Handler.post
-  // Karena kita tidak bisa buat Runnable dari native dengan mudah,
-  // kita pakai trick: post dengan objek Toast yang sudah dibuat
-  // dan panggil show() melalui reflection di main thread.
-  // Alternatif lebih sederhana: panggil show() langsung — Toast.show() aman
-  // dari thread manapun pada API modern.
-  if (show) env->CallVoidMethod(toast, show);
+static void maybeShowInitToast() {
+  if (g_initToastDone.exchange(true)) return;
+  showToast("MODS: Inisialisasi berhasil.");
 }
 
 static bool resolveIl2cpp() {
@@ -174,88 +208,104 @@ static bool looksValid(void* addr) {
   Dl_info info;
   if (!dladdr(addr, &info) || !info.dli_fbase) return false;
   uint32_t first = *reinterpret_cast<uint32_t*>(addr);
-  // Filter thunk ARM64: ret (0xd65f03c0) atau b (opcode 000101...)
   if (first == 0xd65f03c0) return false;
-  if ((first & 0xfc000000) == 0x14000000) return true; // b (biasanya thunk ke fungsi asli)
   return true;
 }
 
-static void scanTargets(void* klass) {
-  void* iter = nullptr;
-  void* m;
-  while ((m = il.methodsOf(klass, &iter))) {
-    const char* name = il.methodName(m);
-    if (!name) continue;
-    int argc = il.paramCount(m);
-    void* addr = methodAddr(m);
-    if (!looksValid(addr)) continue;
-
-#define match(mname, args, field) \
-    if (!tgt.field && strcmp(name, mname) == 0 && argc == (args)) { \
-      tgt.field = addr; logI("[+] %s(%d) @ %p", mname, args, addr); continue; }
-
-    match("InitiatePurchase",          1, initiate)
-    match("DebugEditorPurchase",       1, debug)
-    match("get_HasInfinityPack",       0, hasInfinity)
-    match("get_ActualHasInfinityPack", 0, actualHasInfinity)
-    match("get_HasDisabledAds",        0, hasDisabledAds)
-    match("get_ActualHasDisabledAds",  0, actualHasDisabledAds)
-    match("MayShowAnAd",               0, mayShowAd)
-    match("Revoke",                    1, revokeWithBool)
-    match("Revoke",                    0, revoke)
-#undef match
-  }
-}
-
-static void findIapClass() {
+static void scanAllTargets() {
   void* domain = il.domainGet();
-  if (!domain) { logE("Domain il2cpp belum siap"); return; }
+  if (!domain) return;
 
   size_t count = 0;
   void** asms = il.getAssemblies(domain, &count);
   if (!asms) return;
 
-  for (size_t i = 0; i < count && !iapClass; ++i) {
+  for (size_t i = 0; i < count; ++i) {
     void* image = il.imageOf(asms[i]);
     if (!image) continue;
     size_t classes = il.classCount(image);
-    for (size_t j = 0; j < classes && !iapClass; ++j) {
+    for (size_t j = 0; j < classes; ++j) {
       void* klass = il.classAt(image, j);
       if (!klass) continue;
+
+      bool hasInfMarker = false;
+      bool hasAdsMarker = false;
 
       void* iter = nullptr;
       void* m;
       while ((m = il.methodsOf(klass, &iter))) {
         const char* name = il.methodName(m);
-        if (name && strcmp(name, "InitiatePurchase") == 0 && il.paramCount(m) == 1) {
-          iapClass = klass;
-          logI("[+] Class IAP ditemukan");
-          break;
+        if (!name) continue;
+        int argc = il.paramCount(m);
+        void* addr = methodAddr(m);
+        if (!looksValid(addr)) continue;
+
+        if (!strcmp(name, "get_HasInfinityPack")) hasInfMarker = true;
+        if (!strcmp(name, "get_HasDisabledAds"))  hasAdsMarker = true;
+
+        if (!tgt.initiate && !strcmp(name, "InitiatePurchase") && argc == 1)
+          tgt.initiate = addr;
+        else if (!tgt.debug && !strcmp(name, "DebugEditorPurchase") && argc == 1)
+          tgt.debug = addr;
+        else if (!tgt.hasInfinity && !strcmp(name, "get_HasInfinityPack") && argc == 0)
+          tgt.hasInfinity = addr;
+        else if (!tgt.actualHasInfinity && !strcmp(name, "get_ActualHasInfinityPack") && argc == 0)
+          tgt.actualHasInfinity = addr;
+        else if (!tgt.hasDisabledAds && !strcmp(name, "get_HasDisabledAds") && argc == 0)
+          tgt.hasDisabledAds = addr;
+        else if (!tgt.actualHasDisabledAds && !strcmp(name, "get_ActualHasDisabledAds") && argc == 0)
+          tgt.actualHasDisabledAds = addr;
+        else if (!tgt.mayShowAd && !strcmp(name, "MayShowAnAd") && argc == 0)
+          tgt.mayShowAd = addr;
+      }
+
+      if (hasInfMarker || hasAdsMarker) {
+        void* iter2 = nullptr;
+        while ((m = il.methodsOf(klass, &iter2))) {
+          const char* name = il.methodName(m);
+          if (!name || strcmp(name, "Revoke") != 0) continue;
+          int argc = il.paramCount(m);
+          void* addr = methodAddr(m);
+          if (!looksValid(addr)) continue;
+
+          if (!tgt.revokeWithBool && argc == 1) tgt.revokeWithBool = addr;
+          if (!tgt.revoke && argc == 0)         tgt.revoke = addr;
         }
       }
     }
   }
+
+  logI("[+] initiate             @ %p", tgt.initiate);
+  logI("[+] debug                @ %p", tgt.debug);
+  logI("[+] hasInfinity          @ %p", tgt.hasInfinity);
+  logI("[+] actualHasInfinity    @ %p", tgt.actualHasInfinity);
+  logI("[+] hasDisabledAds       @ %p", tgt.hasDisabledAds);
+  logI("[+] actualHasDisabledAds @ %p", tgt.actualHasDisabledAds);
+  logI("[+] mayShowAd            @ %p", tgt.mayShowAd);
+  logI("[+] revokeWithBool       @ %p", tgt.revokeWithBool);
+  logI("[+] revoke               @ %p", tgt.revoke);
 }
 
 typedef void (*VoidPtrFn)(void*);
 
 static bool hookInitiate(void* productId) {
+  maybeShowInitToast();
   if (tgt.debug)
     reinterpret_cast<VoidPtrFn>(tgt.debug)(productId);
-  toastOnMain("MODS: Pembelian berhasil disimulasikan.");
+  showToast("MODS: Pembelian berhasil disimulasikan.");
   return true;
 }
 
-static bool retTrue()      { return true;  }
-static bool retFalse()     { return false; }
-static void noop()         {}
-static void noopBool(bool) {}
+static bool retTrue()      { maybeShowInitToast(); return true;  }
+static bool retFalse()     { maybeShowInitToast(); return false; }
+static void noop()         { maybeShowInitToast(); }
+static void noopBool(bool) { maybeShowInitToast(); }
 
 static void installHooks() {
 #define hook(field, fn) do { if (tgt.field) { \
     A64HookFunction(tgt.field, reinterpret_cast<void*>(fn), nullptr); \
     logI("[Hook] " #field " OK"); \
-  } else logI("[Hook] " #field " dilewati (tidak ditemukan)"); } while (0)
+  } else logI("[Hook] " #field " dilewati"); } while (0)
 
   hook(initiate,             hookInitiate);
   hook(hasInfinity,          retTrue);
@@ -275,9 +325,10 @@ static void* worker(void*) {
   }
   sleep(2);
 
+  logI("Memulai inisialisasi, log: %s", g_logPath[0] ? g_logPath : "(belum tersedia)");
+
   if (!resolveIl2cpp()) { logE("[Fatal] Gagal resolve il2cpp"); return nullptr; }
 
-  // Tunggu domain il2cpp siap
   void* domain = nullptr;
   for (int i = 0; i < 60; ++i) {
     domain = il.domainGet();
@@ -287,18 +338,16 @@ static void* worker(void*) {
   if (!domain) { logE("[Fatal] Domain il2cpp tidak siap"); return nullptr; }
   il.threadAttach(domain);
 
-  findIapClass();
-  if (!iapClass) { logE("[Fatal] Class IAP tidak ditemukan"); return nullptr; }
-
-  scanTargets(iapClass);
+  scanAllTargets();
   installHooks();
 
-  toastOnMain("MODS: Inisialisasi berhasil.");
-  logI("[Info] Inisialisasi berhasil.");
+  logI("[Info] Inisialisasi selesai.");
   return nullptr;
 }
 
 static void startWorker() {
+  bool expected = false;
+  if (!g_started.compare_exchange_strong(expected, true)) return;
   pthread_t t;
   if (pthread_create(&t, nullptr, worker, nullptr) == 0) pthread_detach(t);
 }
@@ -311,5 +360,5 @@ extern "C" jint JNI_OnLoad(JavaVM* vm, void*) {
 
 __attribute__((constructor))
 static void onLoad() {
-  if (!gVm) startWorker();
+  startWorker();
 }
