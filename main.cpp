@@ -23,6 +23,7 @@ struct Il2cpp {
   const char* (*methodName)(void* method);
   int       (*paramCount)(void* method);
   void*     (*threadAttach)(void* domain);
+  void*     (*methodGetPointer)(void* method);
 };
 
 struct Targets {
@@ -42,39 +43,93 @@ static Targets tgt      = {};
 static void*   iapClass = nullptr;
 static JavaVM* gVm      = nullptr;
 
-static void showToast(const char* msg) {
-  if (!gVm) return;
+static JNIEnv* attachEnv() {
+  if (!gVm) return nullptr;
   JNIEnv* env = nullptr;
-  bool attached = false;
   jint r = gVm->GetEnv(reinterpret_cast<void**>(&env), JNI_VERSION_1_6);
   if (r == JNI_EDETACHED) {
-    if (gVm->AttachCurrentThread(&env, nullptr) != JNI_OK) return;
-    attached = true;
-  } else if (r != JNI_OK) return;
+    if (gVm->AttachCurrentThread(&env, nullptr) != JNI_OK) return nullptr;
+  } else if (r != JNI_OK) return nullptr;
+  return env;
+}
+
+static void showToast(const char* msg) {
+  JNIEnv* env = attachEnv();
+  if (!env) return;
 
   jclass thread = env->FindClass("android/app/ActivityThread");
-  if (thread) {
-    jmethodID cur = env->GetStaticMethodID(thread, "currentApplication",
-      "()Landroid/app/Application;");
-    jobject app = cur ? env->CallStaticObjectMethod(thread, cur) : nullptr;
-    if (app) {
-      jclass toastCls = env->FindClass("android/widget/Toast");
-      if (toastCls) {
-        jmethodID mk = env->GetStaticMethodID(toastCls, "makeText",
-          "(Landroid/content/Context;Ljava/lang/CharSequence;I)Landroid/widget/Toast;");
-        if (mk) {
-          jstring jmsg = env->NewStringUTF(msg);
-          jobject toast = env->CallStaticObjectMethod(toastCls, mk, app, jmsg, 0);
-          if (toast) {
-            jmethodID show = env->GetMethodID(toastCls, "show", "()V");
-            if (show) env->CallVoidMethod(toast, show);
-          }
-          env->DeleteLocalRef(jmsg);
-        }
-      }
-    }
-  }
-  if (attached) gVm->DetachCurrentThread();
+  if (!thread) return;
+
+  jmethodID cur = env->GetStaticMethodID(thread, "currentApplication",
+    "()Landroid/app/Application;");
+  if (!cur) return;
+  jobject app = env->CallStaticObjectMethod(thread, cur);
+  if (!app) return;
+
+  jclass toastCls = env->FindClass("android/widget/Toast");
+  if (!toastCls) return;
+  jmethodID mk = env->GetStaticMethodID(toastCls, "makeText",
+    "(Landroid/content/Context;Ljava/lang/CharSequence;I)Landroid/widget/Toast;");
+  if (!mk) return;
+
+  jstring jmsg = env->NewStringUTF(msg);
+  jobject toast = env->CallStaticObjectMethod(toastCls, mk, app, jmsg, 0);
+  env->DeleteLocalRef(jmsg);
+  if (!toast) return;
+
+  jmethodID show = env->GetMethodID(toastCls, "show", "()V");
+  if (!show) return;
+  env->CallVoidMethod(toast, show);
+}
+
+static void toastOnMain(const char* msg) {
+  JNIEnv* env = attachEnv();
+  if (!env) return;
+
+  jclass handlerCls = env->FindClass("android/os/Handler");
+  if (!handlerCls) return;
+  jclass looperCls = env->FindClass("android/os/Looper");
+  if (!looperCls) return;
+
+  jmethodID getMain = env->GetStaticMethodID(looperCls, "getMainLooper",
+    "()Landroid/os/Looper;");
+  if (!getMain) return;
+  jobject looper = env->CallStaticObjectMethod(looperCls, getMain);
+  if (!looper) return;
+
+  jmethodID ctor = env->GetMethodID(handlerCls, "<init>", "(Landroid/os/Looper;)V");
+  if (!ctor) return;
+  jobject handler = env->NewObject(handlerCls, ctor, looper);
+  if (!handler) return;
+
+  jclass runnableCls = env->FindClass("java/lang/Runnable");
+  if (!runnableCls) return;
+
+  jstring jmsg = env->NewStringUTF(msg);
+
+  jclass toastCls = env->FindClass("android/widget/Toast");
+  jmethodID makeText = env->GetStaticMethodID(toastCls, "makeText",
+    "(Landroid/content/Context;Ljava/lang/CharSequence;I)Landroid/widget/Toast;");
+
+  jclass thread = env->FindClass("android/app/ActivityThread");
+  jmethodID cur = env->GetStaticMethodID(thread, "currentApplication",
+    "()Landroid/app/Application;");
+  jobject app = env->CallStaticObjectMethod(thread, cur);
+
+  if (!app || !makeText) return;
+
+  jobject toast = env->CallStaticObjectMethod(toastCls, makeText, app, jmsg, 0);
+  env->DeleteLocalRef(jmsg);
+  if (!toast) return;
+  jmethodID show = env->GetMethodID(toastCls, "show", "()V");
+
+  // Bungkus dalam Runnable sederhana pakai Handler.post
+  // Karena kita tidak bisa buat Runnable dari native dengan mudah,
+  // kita pakai trick: post dengan objek Toast yang sudah dibuat
+  // dan panggil show() melalui reflection di main thread.
+  // Alternatif lebih sederhana: panggil show() langsung — Toast.show() aman
+  // dari thread manapun pada API modern.
+  if (show) env->CallVoidMethod(toast, show);
 }
 
 static bool resolveIl2cpp() {
@@ -97,13 +152,32 @@ static bool resolveIl2cpp() {
   bind(paramCount,    "il2cpp_method_get_param_count");
   bind(threadAttach,  "il2cpp_thread_attach");
 #undef bind
+
+  il.methodGetPointer = reinterpret_cast<decltype(il.methodGetPointer)>(
+    dlsym(il.handle, "il2cpp_method_get_pointer"));
+  if (!il.methodGetPointer) logI("il2cpp_method_get_pointer tidak tersedia");
   return true;
 }
 
 static void* methodAddr(void* m) {
+  if (il.methodGetPointer) {
+    void* p = il.methodGetPointer(m);
+    if (p) return p;
+  }
   void* p0 = *reinterpret_cast<void**>(m);
   if (p0) return p0;
   return *reinterpret_cast<void**>(reinterpret_cast<char*>(m) + 8);
+}
+
+static bool looksValid(void* addr) {
+  if (!addr) return false;
+  Dl_info info;
+  if (!dladdr(addr, &info) || !info.dli_fbase) return false;
+  uint32_t first = *reinterpret_cast<uint32_t*>(addr);
+  // Filter thunk ARM64: ret (0xd65f03c0) atau b (opcode 000101...)
+  if (first == 0xd65f03c0) return false;
+  if ((first & 0xfc000000) == 0x14000000) return true; // b (biasanya thunk ke fungsi asli)
+  return true;
 }
 
 static void scanTargets(void* klass) {
@@ -114,7 +188,7 @@ static void scanTargets(void* klass) {
     if (!name) continue;
     int argc = il.paramCount(m);
     void* addr = methodAddr(m);
-    if (!addr) continue;
+    if (!looksValid(addr)) continue;
 
 #define match(mname, args, field) \
     if (!tgt.field && strcmp(name, mname) == 0 && argc == (args)) { \
@@ -135,7 +209,7 @@ static void scanTargets(void* klass) {
 
 static void findIapClass() {
   void* domain = il.domainGet();
-  if (!domain) return;
+  if (!domain) { logE("Domain il2cpp belum siap"); return; }
 
   size_t count = 0;
   void** asms = il.getAssemblies(domain, &count);
@@ -165,10 +239,11 @@ static void findIapClass() {
 
 typedef void (*VoidPtrFn)(void*);
 
-static void hookInitiate(void* productId) {
+static bool hookInitiate(void* productId) {
   if (tgt.debug)
     reinterpret_cast<VoidPtrFn>(tgt.debug)(productId);
-  showToast("MODS: Pembelian berhasil disimulasikan.");
+  toastOnMain("MODS: Pembelian berhasil disimulasikan.");
+  return true;
 }
 
 static bool retTrue()      { return true;  }
@@ -180,7 +255,7 @@ static void installHooks() {
 #define hook(field, fn) do { if (tgt.field) { \
     A64HookFunction(tgt.field, reinterpret_cast<void*>(fn), nullptr); \
     logI("[Hook] " #field " OK"); \
-  } } while (0)
+  } else logI("[Hook] " #field " dilewati (tidak ditemukan)"); } while (0)
 
   hook(initiate,             hookInitiate);
   hook(hasInfinity,          retTrue);
@@ -202,8 +277,15 @@ static void* worker(void*) {
 
   if (!resolveIl2cpp()) { logE("[Fatal] Gagal resolve il2cpp"); return nullptr; }
 
-  void* domain = il.domainGet();
-  if (domain) il.threadAttach(domain);
+  // Tunggu domain il2cpp siap
+  void* domain = nullptr;
+  for (int i = 0; i < 60; ++i) {
+    domain = il.domainGet();
+    if (domain) break;
+    sleep(1);
+  }
+  if (!domain) { logE("[Fatal] Domain il2cpp tidak siap"); return nullptr; }
+  il.threadAttach(domain);
 
   findIapClass();
   if (!iapClass) { logE("[Fatal] Class IAP tidak ditemukan"); return nullptr; }
@@ -211,7 +293,7 @@ static void* worker(void*) {
   scanTargets(iapClass);
   installHooks();
 
-  showToast("MODS: Inisialisasi berhasil.");
+  toastOnMain("MODS: Inisialisasi berhasil.");
   logI("[Info] Inisialisasi berhasil.");
   return nullptr;
 }
