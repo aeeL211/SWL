@@ -1,0 +1,6 @@
+#pragma once
+#include <cstdint>
+
+extern "C" {
+  void A64HookFunction(void* const symbol, void* const replace, void** result);
+}
