@@ -14,12 +14,27 @@ if(NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE Release)
 endif()
 
-add_library(fbrian SHARED 
-  main.cpp
-  And64InlineHook.cpp
+# ShadowHook: path diberikan oleh build.yml (hasil ekstrak AAR)
+#   -DSHADOWHOOK_INCLUDE_DIR=<folder berisi shadowhook.h>
+#   -DSHADOWHOOK_LIB=<path libshadowhook.so untuk ABI ini>
+if(NOT SHADOWHOOK_INCLUDE_DIR OR NOT SHADOWHOOK_LIB)
+  message(FATAL_ERROR "Set SHADOWHOOK_INCLUDE_DIR dan SHADOWHOOK_LIB")
+endif()
+
+add_library(shadowhook SHARED IMPORTED)
+set_target_properties(shadowhook PROPERTIES
+  IMPORTED_LOCATION "${SHADOWHOOK_LIB}"
+  IMPORTED_SONAME "libshadowhook.so"
 )
 
-target_include_directories(fbrian PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+add_library(fbrian SHARED
+  main.cpp
+)
+
+target_include_directories(fbrian PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}
+  ${SHADOWHOOK_INCLUDE_DIR}
+)
 
 target_compile_options(fbrian PRIVATE
   -Oz
@@ -45,12 +60,15 @@ target_link_options(fbrian PRIVATE
   -Wl,--exclude-libs,ALL
   -Wl,--build-id=none
   -Wl,--hash-style=gnu
+  -Wl,-z,max-page-size=16384
 )
 
-target_link_libraries(fbrian PRIVATE dl)
+# dl (dlopen/dlsym) dan shadowhook. liblog tidak lagi dibutuhkan (logging dihapus).
+target_link_libraries(fbrian PRIVATE dl shadowhook)
 
 set_target_properties(fbrian PROPERTIES
   CXX_VISIBILITY_PRESET hidden
   VISIBILITY_INLINES_HIDDEN ON
   OUTPUT_NAME "fbrian"
+  LIBRARY_OUTPUT_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/lib/${ANDROID_ABI}"
 )
