@@ -8,16 +8,17 @@ include(FetchContent)
 FetchContent_Declare(
   shadowhook
   GIT_REPOSITORY https://github.com/bytedance/android-inline-hook.git
-  GIT_TAG        v1.0.10
+  GIT_TAG        v2.0.1
   GIT_SHALLOW    TRUE
-  SOURCE_SUBDIR  shadowhook
+  SOURCE_SUBDIR  shadowhook/src/main/cpp
+  PATCH_COMMAND  sed -i "s/cmake_minimum_required(VERSION 4.0.2)/cmake_minimum_required(VERSION 3.20)/" shadowhook/src/main/cpp/CMakeLists.txt
 )
 FetchContent_MakeAvailable(shadowhook)
 
 add_library(fbrian SHARED main.cpp)
 
 target_include_directories(fbrian PRIVATE
-  ${shadowhook_SOURCE_DIR}/include
+  ${shadowhook_SOURCE_DIR}/shadowhook/src/main/cpp/include
 )
 
 target_link_libraries(fbrian PRIVATE
