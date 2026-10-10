@@ -2,17 +2,21 @@ name: Build SWLMods
 
 on:
   push:
-    branches: [main, master]
+    branches: [main]
   workflow_dispatch:
     inputs:
       log:
         description: "Enable logcat output (off = smallest .so)"
         type: boolean
         default: true
+      shadowhook:
+        description: "ShadowHook version (try 1.0.10 if init fails with error 12; avoid 1.1.1)"
+        type: string
+        default: "2.0.1"
 
 env:
-  # Pinned. Newest on Maven Central at time of writing; 1.1.1 is the previous stable line.
-  SHADOWHOOK_VERSION: "2.0.1"
+  # Pinned. 1.1.1 is known broken (error 12 on many devices, upstream issue #91).
+  SHADOWHOOK_VERSION: ${{ inputs.shadowhook || '2.0.1' }}
 
 jobs:
   build:
@@ -53,6 +57,17 @@ jobs:
           done
           echo "AAR layout OK:"; ls -la "$HDR" "$SO"
 
+          # companion lib of shadowhook 2.x (not present in 1.x), must sit next to libshadowhook.so
+          NOTHING="$(find shadowhook -type f -name libshadowhook_nothing.so -path "*${{ matrix.abi }}*" -print -quit)"
+          if [ -z "$NOTHING" ]; then
+            case "$SHADOWHOOK_VERSION" in
+              1.*) echo "::notice::no libshadowhook_nothing.so in this AAR (expected for 1.x)" ;;
+              *) echo "::error::libshadowhook_nothing.so missing in AAR"; find shadowhook -type f | sort; exit 1 ;;
+            esac
+          fi
+          echo "NOTHING_SO=$NOTHING" >> "$GITHUB_ENV"
+          echo "nothing lib: ${NOTHING:-none}"
+
       - name: Configure CMake
         run: |
           cmake -S . -B build/${{ matrix.abi }} \
@@ -73,6 +88,7 @@ jobs:
           mkdir -p "$OUT"
           cp "build/${{ matrix.abi }}/lib/${{ matrix.abi }}/libfbrian.so" "$OUT/"
           cp "shadowhook/prefab/modules/shadowhook/libs/android.${{ matrix.abi }}/libshadowhook.so" "$OUT/"
+          if [ -n "$NOTHING_SO" ]; then cp "$NOTHING_SO" "$OUT/"; fi
           ls -l "$OUT"
           wc -c "$OUT/libfbrian.so"
 
@@ -88,7 +104,8 @@ jobs:
             WANT_CLASS="ELF32"; WANT_MACHINE="ARM"
           fi
 
-          for so in libfbrian.so libshadowhook.so; do
+          for so in libfbrian.so libshadowhook.so libshadowhook_nothing.so; do
+            [ -f "$OUT/$so" ] || continue
             echo "== $so"
             "$RE" -h "$OUT/$so" | grep -E "Class:|Machine:"
             "$RE" -h "$OUT/$so" | grep -Eq "Class: +${WANT_CLASS}\$"     || { echo "::error::$so wrong ELF class";   exit 1; }
