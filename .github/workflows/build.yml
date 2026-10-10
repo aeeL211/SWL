@@ -100,6 +100,10 @@ jobs:
           "$RE" -d "$OUT/libfbrian.so" | grep -q "NEEDED.*\[libshadowhook\.so\]" \
             || { echo "::error::libfbrian.so does not list NEEDED [libshadowhook.so]"; exit 1; }
 
+          # libfbrian must export its own JNI_OnLoad, else ART picks libshadowhook's and fails
+          "$RE" --dyn-syms "$OUT/libfbrian.so" | grep -Eq "FUNC +GLOBAL +DEFAULT +[0-9]+ JNI_OnLoad\$" \
+            || { echo "::error::libfbrian.so does not export JNI_OnLoad"; exit 1; }
+
           # Informational: a shared C++ runtime would have to be packaged too
           if "$RE" -d "$OUT/libfbrian.so" | grep -q "libc++_shared"; then
             echo "::warning::libfbrian.so needs libc++_shared.so"
