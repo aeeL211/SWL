@@ -1,4 +1,5 @@
 #include <dlfcn.h>
+#include <jni.h>
 #include <pthread.h>
 #include <unistd.h>
 #include <cstdint>
@@ -220,6 +221,11 @@ static void* worker(void*) {
   installAll();
   return nullptr;
 }
+
+// exported on purpose: otherwise ART resolves JNI_OnLoad from libshadowhook.so
+// and the load fails with JNI_ERR
+extern "C" __attribute__((visibility("default")))
+jint JNI_OnLoad(JavaVM*, void*) { return JNI_VERSION_1_6; }
 
 __attribute__((constructor))
 static void onLoad() {
