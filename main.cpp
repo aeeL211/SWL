@@ -176,6 +176,7 @@ static void scan() {
 static bool initHook() {
   [[maybe_unused]] int e = shadowhook_init(SHADOWHOOK_MODE_UNIQUE, false);
   if (e) LOGE("init failed: %d %s", e, shadowhook_to_errmsg(e));
+  else LOGI("init ok");
   return !e;
 }
 
@@ -196,6 +197,7 @@ static void installAll() {
 }
 
 static void* worker(void*) {
+  LOGI("worker start");
   // init here, not in the constructor: it runs under the linker lock
   if (!initHook()) return nullptr;
 
@@ -207,6 +209,7 @@ static void* worker(void*) {
     LOGE("il2cpp api not found");
     return nullptr;
   }
+  LOGI("il2cpp api ok");
 
   // wait for il2cpp domain
   void* dom = nullptr;
@@ -216,8 +219,11 @@ static void* worker(void*) {
     return nullptr;
   }
 
+  LOGI("domain ready, scanning");
   api.attach(dom);
   scan();
+  LOGI("scan done, found %d of %d", (int)(sizeof(hooks) / sizeof(hooks[0])) - left,
+       (int)(sizeof(hooks) / sizeof(hooks[0])));
   installAll();
   return nullptr;
 }
@@ -229,6 +235,8 @@ jint JNI_OnLoad(JavaVM*, void*) { return JNI_VERSION_1_6; }
 
 __attribute__((constructor))
 static void onLoad() {
+  LOGI("loaded");
   pthread_t t;
   if (pthread_create(&t, nullptr, worker, nullptr) == 0) pthread_detach(t);
+  else LOGE("thread create failed");
 }
